@@ -25,7 +25,7 @@ int encoderPinB = 19;
 int encoderButtonPin = 3;
 int lastPWMValue = 255;  // Start with a low RPM (higher PWM value)
 int targetPWM = 255; 
-int rampStep = 1;  
+int rampStep = 50;  
 // Variables for RPM control and feedback
 volatile int encoderPos = 250;  // Initialize encoder position for low RPM start
 int pwmValue = 255;             // Initialize PWM to a value for low RPM
@@ -82,8 +82,8 @@ void encoderISR() {
   if ((millis() - lastEncoderTime) > encoderDebounceDelay) {
     // Only update the targetPWM if the motor is running
     if (motorRunning) {
-      // Reverse encoder direction: CW should increase RPM (decrease PWM)
-      if (digitalRead(encoderPinA) == digitalRead(encoderPinB)) {
+      // Encoder direction: CW should increase RPM (decrease PWM)
+      if (digitalRead(encoderPinA) != digitalRead(encoderPinB)) {
         encoderPos += 1;  // Increase encoder position (increase RPM)
       } else {
         encoderPos -= 1;  // Decrease encoder position (decrease RPM)
@@ -102,7 +102,7 @@ void countPulse() {
 // Setup function
 void setup() {
   // Initialize Serial Monitor
-  Serial.begin(9600);
+  Serial.begin(115200);
 
   // Set motor control pins
   pinMode(pwmPin, OUTPUT);
@@ -250,7 +250,7 @@ void calculateRPM() {
 // Function to display RPM on seven-segment display
 void displayRPM(int rpm) {
   unsigned long currentTime = millis();
-  if (currentTime - lastRefreshTime > 5) {  // Refresh every 5 ms per digit
+  if (currentTime - lastRefreshTime > 1) {  // Refresh every 5 ms per digit
     lastRefreshTime = currentTime;
 
     // Break down RPM value into digits
