@@ -250,7 +250,7 @@ void calculateRPM() {
 // Function to display RPM on seven-segment display
 void displayRPM(int rpm) {
   unsigned long currentTime = millis();
-  if (currentTime - lastRefreshTime > 1) {  // Refresh every 5 ms per digit
+  if (currentTime - lastRefreshTime > 0.5) {  // Refresh every 0.5 ms per digit
     lastRefreshTime = currentTime;
 
     // Break down RPM value into digits
