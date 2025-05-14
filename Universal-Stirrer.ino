@@ -25,7 +25,7 @@ int encoderPinB = 19;
 int encoderButtonPin = 3;
 int lastPWMValue = 255;  // Start with a low RPM (higher PWM value)
 int targetPWM = 255; 
-int rampStep = 50;  
+int rampStep = 5;  
 // Variables for RPM control and feedback
 volatile int encoderPos = 250;  // Initialize encoder position for low RPM start
 int pwmValue = 255;             // Initialize PWM to a value for low RPM
@@ -240,10 +240,6 @@ void calculateRPM() {
     // Assuming 5 pulses per revolution
     currentRPM = (pulseCount * 60) / 5;  // Convert pulses to RPM
     pulseCount = 0;  // Reset pulse count for the next calculation
-    
-    // Print the current RPM to the Serial Monitor
-    // Serial.print("Current RPM: ");
-    // Serial.println(currentRPM);
   }
 }
 
