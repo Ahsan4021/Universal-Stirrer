@@ -1,3 +1,8 @@
+// Universal Stirrer Design for BLDC with Built in Driver and Display controll using Encoder and 7 Segment 4 Digit
+
+#include <EEPROM.h>
+const int EEPROM_RPM_ADDR = 0;  // Starting byte to store RPM
+
 // Define motor control and feedback pins
 const int pwmPin = 46;         // PWM pin connected to the blue line of the motor
 const int dirPin = 13;        // Digital pin for direction (connected to the yellow line)
@@ -19,13 +24,30 @@ int D2 = A3;
 int D3 = A4;
 int D4 = A6;
 
+int desiredRPM = 0;              // Target RPM (set via encoder)
+float dutyCycle = 0.0;           // Mapped duty cycle
+int desiredPWM = 0;              // Mapped PWM value from RPM
+int rampUP = 255;                // Start from OFF
+unsigned long lastEncoderMoveTime = 0;
+bool adjustingRPM = false;
+
+bool allowRampUpdate = false;
+unsigned long lastRampUpdate = 0;
+const unsigned long rampInterval = 400;  // in ms (can tweak for smoother/slower)
+
+int lastSavedRPM = -1;
+unsigned long lastEEPROMWrite = 0;
+const unsigned long eepromWriteDelay = 2000;  // Only write after 2s idle
+
+
 // Rotary encoder pins for adjusting RPM
 int encoderPinA = 18;
 int encoderPinB = 19;
 int encoderButtonPin = 3;
 int lastPWMValue = 255;  // Start with a low RPM (higher PWM value)
 int targetPWM = 255; 
-int rampStep = 5;  
+const int rampStep = 5;
+
 // Variables for RPM control and feedback
 volatile int encoderPos = 250;  // Initialize encoder position for low RPM start
 int pwmValue = 255;             // Initialize PWM to a value for low RPM
@@ -49,7 +71,7 @@ unsigned long lastRefreshTime = 0;
 int currentDigit = 0;
 
 // Motor control flag
-bool motorRunning = true;  // Motor is running by default
+bool motorRunning = false;  // Motor is not running by default
 
 // Display control flag
 bool showOn = false;
@@ -80,20 +102,26 @@ void display_r();
 // Interrupt Service Routine (ISR) for encoder to adjust RPM
 void encoderISR() {
   if ((millis() - lastEncoderTime) > encoderDebounceDelay) {
-    // Only update the targetPWM if the motor is running
     if (motorRunning) {
-      // Encoder direction: CW should increase RPM (decrease PWM)
       if (digitalRead(encoderPinA) != digitalRead(encoderPinB)) {
-        encoderPos += 1;  // Increase encoder position (increase RPM)
+        desiredRPM -= 50;
       } else {
-        encoderPos -= 1;  // Decrease encoder position (decrease RPM)
+        desiredRPM += 50;
       }
-      encoderPos = constrain(encoderPos, 0, 255);  // Constrain to valid PWM range
-      targetPWM = encoderPos;  // Update the target PWM value
+      desiredRPM = constrain(desiredRPM, 0, 3950);
+
+      adjustingRPM = true;
+      allowRampUpdate = false;
       lastEncoderTime = millis();
+      lastEncoderMoveTime = millis();
+
+      Serial.print("Set RPM: ");
+      Serial.println(desiredRPM);
     }
   }
 }
+
+
 // Interrupt Service Routine (ISR) to count pulses from the feedback pin
 void countPulse() {
   pulseCount++;  // Increment pulse count for each feedback signal
@@ -104,8 +132,18 @@ void setup() {
   // Initialize Serial Monitor
   Serial.begin(115200);
 
+  //EEPROM Initialize and Data
+  EEPROM.get(EEPROM_RPM_ADDR, desiredRPM);
+  desiredRPM = constrain(desiredRPM, 0, 3950);  // Safety clamp
+
+  Serial.print("Loaded RPM from EEPROM: ");
+  Serial.println(desiredRPM);
+
+
   // Set motor control pins
-  pinMode(pwmPin, OUTPUT);
+  pinMode(pwmPin, INPUT);       // Disable output
+  displayOFF();                 // Show OFF state immediately
+  analogWrite(pwmPin, 255);     // Fully off (255 for inverted PWM logic)
   pinMode(dirPin, OUTPUT);
   pinMode(feedbackPin, INPUT_PULLUP);
 
@@ -139,96 +177,239 @@ void setup() {
 }
 
 void loop() {
-  // Check if the encoder button is pressed and debounce the press
+  // Toggle motor via encoder button
   if (digitalRead(encoderButtonPin) == LOW && (millis() - lastButtonPressTime) > debounceDelay) {
-  motorRunning = !motorRunning;  // Toggle motor state
-  lastButtonPressTime = millis();
+    motorRunning = !motorRunning;
+    lastButtonPressTime = millis();
 
-  if (motorRunning) {
-    Serial.println("Motor ON");
-    showOn = true;  // Show "ON" for 3 seconds
-    
-
-    // Initialize the PWM value to 0 and gradually increase to targetPWM
-    pwmValue = 255;  // Start from 0
-    onDisplayTime = millis();  // Record the time "ON" was shown
-  } else {
-    Serial.println("Motor OFF");
-
-    // Stop the motor when turning off
-    analogWrite(pwmPin, 255);   // Ensure motor is stopped (255 PWM means 0 RPM)
-    pinMode(pwmPin, INPUT);     // Disable the PWM pin (set to INPUT)
-    displayOFF();  // Show "OFF" on the display
-
-    // Clear error state and reset error variables when motor is turned off
-    errorState = false;        // Reset the error state
-    rpmZeroStartTime = 0;      // Reset the RPM zero timer
-  }
-}
-
-  // If motor is running, show "ON" for 3 seconds, then return to RPM display
-  if (motorRunning && !errorState) {
-  if (showOn) {
-    displayON();  // Display "ON"
-    if (millis() - onDisplayTime >= 3000) {
-      showOn = false;  // After 3 seconds, stop showing "ON"
-    }
-  } else {
-    updatePWMWithRamp();  // Gradually adjust PWM to target value
-  }
-}
-
-  // Calculate and display the current RPM every second
-  calculateRPM();
-
-  // Check for error condition if the motor is running
-  if (motorRunning && !errorState) {
-    if (currentRPM == 0) {
-      // If RPM is 0, start the timer if it's not already running
-      if (rpmZeroStartTime == 0) {
-        rpmZeroStartTime = millis();
-      } else if (millis() - rpmZeroStartTime >= errorTimeout) {
-        // If RPM is 0 for more than 20 seconds, trigger error state
-        errorState = true;
-        Serial.println("Error: Motor might be jammed!");
-        analogWrite(pwmPin, 255);   // Ensure motor is stopped (255 PWM means 0 RPM)
-        pinMode(pwmPin, INPUT);     // Disable the PWM pin (set to INPUT)
-      }
+    if (motorRunning) {
+      Serial.println("Motor ON");
+      showOn = true;
+      onDisplayTime = millis();
+      rampUP = 255;
+      allowRampUpdate = false;
     } else {
-      // Reset the timer if RPM is not 0
+      Serial.println("Motor OFF");
+      analogWrite(pwmPin, 255);
+      pinMode(pwmPin, INPUT);
+      displayOFF();
+      errorState = false;
       rpmZeroStartTime = 0;
     }
   }
 
-  // Refresh the display
+  // Handle ON display
+  if (motorRunning && !errorState) {
+    if (showOn) {
+      displayON();
+      if (millis() - onDisplayTime >= 3000) {
+        showOn = false;
+        allowRampUpdate = true;
+      }
+    } else {
+      controlMotorSpeed();  // Allow ramp logic
+    }
+  }
+
+  // Update current RPM once per second
+  calculateRPM();
+
+  // Auto-allow ramping after 3s idle
+  if (adjustingRPM && (millis() - lastEncoderMoveTime > 1000)) {
+    adjustingRPM = false;
+    allowRampUpdate = true;
+  }
+  // Save desiredRPM to EEPROM if it changed, and 2s have passed
+  if (desiredRPM != lastSavedRPM && millis() - lastEncoderMoveTime > eepromWriteDelay) {
+    EEPROM.put(EEPROM_RPM_ADDR, desiredRPM);
+    lastSavedRPM = desiredRPM;
+    Serial.print("EEPROM updated with RPM: ");
+    Serial.println(desiredRPM);
+  }
+
+
+  // Error detection: motor stuck
+  if (motorRunning && !errorState) {
+    if (currentRPM == 0) {
+      if (rpmZeroStartTime == 0) {
+        rpmZeroStartTime = millis();
+      } else if (millis() - rpmZeroStartTime >= errorTimeout) {
+        errorState = true;
+        Serial.println("Error: Motor might be jammed!");
+        analogWrite(pwmPin, 255);
+        pinMode(pwmPin, INPUT);
+      }
+    } else {
+      rpmZeroStartTime = 0;
+    }
+  }
+
+// DISPLAY HANDLING
+if (showOn) {
+  displayON();  // Skip all other display logic while "ON" is shown
+} else {
   if (!motorRunning) {
-    displayOFF();  // Show "OFF" on the display
+    displayOFF();
   } else if (errorState) {
-    displayErr();  // Show error on the display
-  } else if (!showOn) {
-    displayRPM(currentRPM);  // Show the current RPM on the display
+    displayErr();
+  } else if (adjustingRPM) {
+    displayRPM(desiredRPM);
+  } else {
+    static bool toggle = false;
+    static unsigned long lastToggle = 0;
+    unsigned long interval = toggle ? 3000 : 1000;  // false = desired, true = current
+
+    if (millis() - lastToggle >= interval) {
+      toggle = !toggle;
+      lastToggle = millis();
+    }
+
+    if (toggle) {
+      displayRPM(currentRPM);
+    } else {
+      displayRPM(desiredRPM);
+    }
+  }
+  }
+
+
+  // SERIAL MONITOR OUTPUT
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint >= 1000) {
+    lastPrint = millis();
+    Serial.print("Current RPM: ");
+    Serial.print(currentRPM);
+    Serial.print(" | Set RPM: ");
+    Serial.print(desiredRPM);
+    Serial.print(" | PWM: ");
+    Serial.println(rampUP);
   }
 }
+
+
+
+int rpmToPwm(int rpm) {
+  if (rpm <= 300) return 255;
+  else if (rpm <= 350) return 240;
+  else if (rpm <= 400) return 238;
+  else if (rpm <= 450) return 236;
+  else if (rpm <= 500) return 233;
+  else if (rpm <= 550) return 230;
+  else if (rpm <= 600) return 228;
+  else if (rpm <= 650) return 225;
+  else if (rpm <= 700) return 222;
+  else if (rpm <= 750) return 220;
+  else if (rpm <= 800) return 217;
+  else if (rpm <= 850) return 214;
+  else if (rpm <= 900) return 212;
+  else if (rpm <= 950) return 210;
+  else if (rpm <= 1000) return 207;
+  else if (rpm <= 1050) return 205;
+  else if (rpm <= 1100) return 203;
+  else if (rpm <= 1150) return 200;
+  else if (rpm <= 1200) return 198;   
+  else if (rpm <= 1250) return 196;
+  else if (rpm <= 1300) return 193;
+  else if (rpm <= 1350) return 191;
+  else if (rpm <= 1400) return 188;
+  else if (rpm <= 1450) return 185;
+  else if (rpm <= 1500) return 182;
+  else if (rpm <= 1550) return 179;
+  else if (rpm <= 1600) return 176;
+  else if (rpm <= 1650) return 173;
+  else if (rpm <= 1700) return 170;
+  else if (rpm <= 1750) return 167;
+  else if (rpm <= 1800) return 164;
+  else if (rpm <= 1850) return 161;
+  else if (rpm <= 1900) return 158;
+  else if (rpm <= 1950) return 155;
+  else if (rpm <= 2000) return 151;
+  else if (rpm <= 2050) return 149;
+  else if (rpm <= 2100) return 145;
+  else if (rpm <= 2150) return 141;
+  else if (rpm <= 2200) return 138;
+  else if (rpm <= 2250) return 135;
+  else if (rpm <= 2300) return 130;
+  else if (rpm <= 2350) return 127;
+  else if (rpm <= 2400) return 123;
+  else if (rpm <= 2450) return 119;
+  else if (rpm <= 2500) return 115;
+  else if (rpm <= 2550) return 111;
+  else if (rpm <= 2600) return 107;
+  else if (rpm <= 2650) return 103;
+  else if (rpm <= 2700) return 99;
+  else if (rpm <= 2750) return 94;
+  else if (rpm <= 2800) return 90;
+  else if (rpm <= 2850) return 85;
+  else if (rpm <= 2900) return 81;
+  else if (rpm <= 2950) return 76;
+  else if (rpm <= 3000) return 72;
+  else if (rpm <= 3050) return 67;
+  else if (rpm <= 3100) return 63;
+  else if (rpm <= 3150) return 58;
+  else if (rpm <= 3200) return 54;
+  else if (rpm <= 3250) return 49;
+  else if (rpm <= 3300) return 45;
+  else if (rpm <= 3350) return 40;
+  else if (rpm <= 3400) return 36;
+  else if (rpm <= 3450) return 32;
+  else if (rpm <= 3500) return 28;
+  else if (rpm <= 3550) return 23;
+  else if (rpm <= 3600) return 18;
+  else if (rpm <= 3650) return 14;
+  else if (rpm <= 3700) return 10;
+  else if (rpm <= 3750) return 5;
+  else if (rpm <= 3800) return 1;
+  else if (rpm <= 3950) return 0;
+
+  else return 0;  
+}
+
 
 
 //Function to gradually adjust PWM to the target value using ramping
-void updatePWMWithRamp() {
-  if (motorRunning) {
-    if (pwmValue < targetPWM) {
-      pwmValue += rampStep;
-      if (pwmValue > targetPWM) pwmValue = targetPWM;
-    } else if (pwmValue > targetPWM) {
-      pwmValue -= rampStep;
-      if (pwmValue < targetPWM) pwmValue = targetPWM;
-    }
-    analogWrite(pwmPin, pwmValue);
-    // Serial.print("Current PWM: ");
-    // Serial.println(pwmValue);
-    delay(1/4);
-  } else {
-    analogWrite(pwmPin, 255); // Stop motor when not running
+void controlMotorSpeed() {
+  desiredPWM = rpmToPwm(desiredRPM);
+
+  if (!motorRunning) {
+    analogWrite(pwmPin, 255);
+    motorOff();
+    return;
   }
+
+  motorON();
+
+  if (!allowRampUpdate) {
+    analogWrite(pwmPin, rampUP);
+    return;
+  }
+
+  // Only update rampUP every rampInterval ms
+  if (millis() - lastRampUpdate >= rampInterval) {
+    lastRampUpdate = millis();
+
+    if (rampUP > desiredPWM) {
+      rampUP -= rampStep;
+      if (rampUP < desiredPWM) rampUP = desiredPWM;
+    } else if (rampUP < desiredPWM) {
+      rampUP += rampStep;
+      if (rampUP > desiredPWM) rampUP = desiredPWM;
+    }
+  }
+
+  analogWrite(pwmPin, rampUP);
 }
+
+
+
+void motorON() {
+  pinMode(pwmPin, OUTPUT);
+}
+
+void motorOff() {
+  pinMode(pwmPin, INPUT);
+}
+
 
 
 // Function to calculate the current RPM from the feedback pin
